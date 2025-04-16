@@ -15,7 +15,6 @@ tools/*.mp4
 *.ipynb
 pretrained_weight/
 output/
-data/
 dataset/
 fine_tuning_v2.py
 fine_tuning.py
