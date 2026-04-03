@@ -4,7 +4,7 @@ import torch.utils.checkpoint
 import contextlib 
 
 from models.tools import sample_poisson_lognormal
-from models.poincare import Uni_Sign_Hyperbolic
+from models.hyperbolic import Uni_Sign_Hyperbolic
         
 class Sign_Loop_Hyperbolic(Uni_Sign_Hyperbolic):
     def __init__(self, args):

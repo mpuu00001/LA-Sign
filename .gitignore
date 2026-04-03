@@ -27,7 +27,5 @@ command
 *.err
 *.out
 convert.py
-config_used.py
-config_tobe_upload.py
-config.py
+config_*.py
 debug/
