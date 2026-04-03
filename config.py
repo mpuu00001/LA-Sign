@@ -1,60 +1,37 @@
 mt5_path = "./pretrained_weight/mt5-base"
-mt5_aux_path = "./pretrained_weight/mt5-base-trim"
 
 # label paths
 train_label_paths = {
-                    "CSL_News": "./data/CSL_News/CSL_News_Labels.json",
-                    "CSL_Daily": "./data/CSL_Daily/labels.train",
-                    "WLASL": "./data/WLASL/labels-2000.train",
-                    "OpenASL": "./data/OpenASL/labels.train",
-                    "How2sign": "./data/How2Sign/labels.train"
+                    "WLASL2000": "./data/WLASL/labels-2000.train",
+                    "WLASL300": "./data/WLASL/labels-300.train",
+                    "MSASL1000": "./data/MSASL/labels-1000.train",
+                    "MSASL200": "./data/MSASL/labels-200.train",
+                    "MSASL100": "./data/MSASL/labels-100.train",
                     }
 
 dev_label_paths = {
-                    "CSL_News": "./data/CSL_News/CSL_News_Labels.json",
-                    "CSL_Daily": "./data/CSL_Daily/labels.dev",
-                    "WLASL": "./data/WLASL/labels-2000.dev",
-                    "OpenASL": "./data/OpenASL/labels.val"
+                    "WLASL2000": "./data/WLASL/labels-2000.dev",
+                    "WLASL300": "./data/WLASL/labels-300.val",
+                    "MSASL1000": "./data/MSASL/labels-1000.val",
+                    "MSASL200": "./data/MSASL/labels-200.val",
+                    "MSASL100": "./data/MSASL/labels-100.val"
                     }
 
 test_label_paths = {
-                    "CSL_News": "./data/CSL_News/CSL_News_Labels.json",
-                    "CSL_Daily": "./data/CSL_Daily/labels.test",
-                    "WLASL": "./data/WLASL/labels-2000.test",
-                    "OpenASL": "./data/OpenASL/labels.test",
-                    "How2sign": "./data/How2Sign/labels.test"
+                    "WLASL2000": "./data/WLASL/labels-2000.test",
+                    "WLASL300": "./data/WLASL/labels-300.test",
+                    "MSASL1000": "./data/MSASL/labels-1000.test",
+                    "MSASL200": "./data/MSASL/labels-200.test",
+                    "MSASL100": "./data/MSASL/labels-100.test",
                     }
 
 # pose paths
 pose_dirs = {
-            "CSL_News": './dataset/CSL_News/pose_format',
-            "CSL_Daily": './dataset/CSL_Daily/pose_format',
             "WLASL": "./dataset/WLASL/pose_format",
-            "OpenASL": "./dataset/OpenASL/pose_format",
-            "How2sign": "./dataset/How2sign/pose_format"
+            "MSASL": "./dataset/MSASL/pose_format",
             }
 
-pose_dirs_gpu = {            
-            "CSL_News": '/CSL_News/pose_format',
-            "CSL_Daily": '/CSL_Daily/pose_format',
-            "WLASL": "/WLASL/pose_format",
-            "OpenASL": "/OpenASL/pose_format",
-            "How2sign": "/How2sign/pose_format"
-            }
-
-# video paths
 rgb_dirs = {
-            "CSL_News": './dataset/CSL_News/rgb_format',
-            "CSL_Daily": './dataset/CSL_Daily/sentence-crop',
             "WLASL": "./dataset/WLASL/rgb_format",
-            "OpenASL": './dataset/WLASL/rgb_format',
-            "How2sign": "./dataset/How2sign/rgb_format"
-            }
-
-rgb_dirs_gpu = {
-            "CSL_News": '/CSL_News/rgb_format',
-            "CSL_Daily": '/CSL_Daily/sentence-crop',
-            "WLASL": '/WLASL/rgb_format',
-            "OpenASL": '/OpenASL/rgb_format',
-            "How2sign": '/How2sign/rgb_format'
+            "MSASL": "./dataset/MSASL/rgb_format",
             }

@@ -2,9 +2,17 @@ import torch
 import torch.nn as nn
 from transformers import MT5ForConditionalGeneration 
 from typing import Optional
-from config import mt5_path, mt5_aux_path
+from config import mt5_path
 import torch.nn.functional as F
 from utils import KLLoss
+import numpy as np
+from sklearn.decomposition import PCA
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -231,9 +239,9 @@ def compute_similarity_values(sim_matrix, strategy='row_max'):
 
 def tokenwise_similarity(Q, D, row_strategy='row_max', score_strategy='sum', similarity_metric='cosine'):
     if similarity_metric == 'cosine':
-        sim_matrix = Q @ D.permute(0, 2, 1)  
-        sim_values = compute_similarity_values(sim_matrix, strategy=row_strategy)
-        sim_score = compute_similarity_score(sim_values, strategy=score_strategy)
+        sim_matrix = Q @ D.permute(0, 2, 1)  # [B, S/T, T/S]
+        sim_values = compute_similarity_values(sim_matrix, strategy=row_strategy) # [B S/T]
+        sim_score = compute_similarity_score(sim_values, strategy=score_strategy) # [B]
         return sim_score
 
     assert similarity_metric == 'l2'
@@ -242,7 +250,7 @@ def tokenwise_similarity(Q, D, row_strategy='row_max', score_strategy='sum', sim
 def sign2text_sim_martix(text_feats, vis_feats, args):
     num_text, num_sign = text_feats.shape[0], vis_feats.shape[0]
     sim_s2t = torch.zeros((num_sign, num_text)).to(text_feats.device)
-    for i in range(num_sign):
+    for i in range(num_sign): # positive pairs vis_feats[i] and text_feats[i], negative pairs vis_feats[i] and text_feats[j]
         row_sim = tokenwise_similarity(vis_feats[i], text_feats, 
                                        row_strategy=args.row_strategy, 
                                        score_strategy=args.score_strategy)
@@ -306,9 +314,9 @@ def gloabal_similarity_loss(vis_global_token, text_global_token, logit_scale, ar
     text_feature = text_global_token
 
     logit_scale = logit_scale.exp()
-    sim_s2t = logit_scale * sign_feature @ text_feature.t()
-    sim_t2s = logit_scale * text_feature @ sign_feature.t()
-    
+    sim_s2t = logit_scale * sign_feature @ text_feature.t() # positive pairs matched sign-text pairs  # [B, B]
+    sim_t2s = logit_scale * text_feature @ sign_feature.t() # negative pairs are unmatched/other sign-text pairs # [B, B]
+
     sim_targets = torch.zeros(sim_s2t.size()).to(sim_t2s.device)
     sim_targets.fill_diagonal_(1)
 
@@ -325,3 +333,375 @@ def gloabal_similarity_loss(vis_global_token, text_global_token, logit_scale, ar
         raise NotImplementedError
     
     return (loss_s2t + loss_t2s) / 2
+
+class StepWarmUpScheduler(object):
+    def __init__(self, start_ratio, end_ratio, warmup_start_step, warmup_step):
+        super().__init__()
+        self.start_ratio = start_ratio
+        self.end_ratio = end_ratio
+        self.warmup_start_step = warmup_start_step
+        self.warmup_step = warmup_step + int(warmup_step == 0)
+        self.step_ratio = (end_ratio - start_ratio) / self.warmup_step
+
+    def forward(self, step_num):
+        if step_num < self.warmup_start_step:
+            return self.start_ratio
+        elif step_num >= self.warmup_step:
+            return self.end_ratio
+        else:
+            ratio = self.start_ratio + self.step_ratio * (step_num - self.warmup_start_step)
+            return ratio
+
+class BiLSTMLayer(nn.Module):
+    def __init__(self, input_size=768, debug=False, hidden_size=256, num_layers=2, dropout=0.3,
+                 bidirectional=True, rnn_type='LSTM'):
+        super(BiLSTMLayer, self).__init__()
+
+        self.dropout = dropout
+        self.num_layers = num_layers
+        self.input_size = input_size
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+        self.hidden_size = int(hidden_size / self.num_directions)
+        self.rnn_type = rnn_type
+        self.debug = debug
+        self.rnn = getattr(nn, self.rnn_type)(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            bidirectional=self.bidirectional,
+            batch_first=True
+        )
+
+    def forward(self, src_feats, src_lens, max_len, hidden=None):
+        """
+        Args:
+            - src_feats: (batch_size, max_src_len, 512)
+            - src_lens: (batch_size)
+        Returns:
+            - outputs: (max_src_len, batch_size, hidden_size * num_directions)
+            - hidden : (num_layers, batch_size, hidden_size * num_directions)
+        """
+        packed_emb = nn.utils.rnn.pack_padded_sequence(src_feats, src_lens.cpu(), batch_first=True, enforce_sorted=False)
+        packed_outputs, hidden = self.rnn(packed_emb)
+        rnn_outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True, total_length=max_len)
+
+        return rnn_outputs
+
+class AdaptiveMask(nn.Module):
+    """
+    DDEM v3
+    """
+
+    def __init__(self, input_size=768, output_size=768, dropout=0.1):
+        """
+        AF module
+        :param input_size: dimensionality of the input.
+        :param output_size: dimensionality of intermediate representation
+        :param dropout:
+        """
+        super(AdaptiveMask, self).__init__()
+        self.lstm = BiLSTMLayer(input_size=input_size, hidden_size=output_size, dropout=dropout)
+        self.linear = nn.Linear(output_size, 1)
+        self.softmax = nn.Softmax(dim=-1)
+        self.layer_norm = nn.LayerNorm(output_size, eps=1e-5)
+
+    def forward(self, input_tensor, input_len, k=2, mask=None):
+        lstm_o = self.lstm(input_tensor, input_len, input_tensor.shape[1])
+        list_out = self.softmax(self.linear(lstm_o).squeeze(-1))
+        _, indices = list_out.topk(k, dim=-1, largest=False, sorted=False)
+        lstm_o = self.layer_norm(lstm_o)
+
+        # update mask
+        if mask is not None:
+            sgn_mask_copy = mask.clone().detach()
+            for b in range(input_tensor.shape[0]):
+                sgn_mask_copy[b, indices[b]] = False
+            return lstm_o, sgn_mask_copy
+        else:
+            return lstm_o
+
+def sample_poisson_lognormal(target_mean, this_sigma=0.5):
+
+    mu = torch.log(torch.tensor(target_mean)) - 0.5 * this_sigma**2
+    
+    lognormal_dist = torch.distributions.LogNormal(mu, this_sigma)
+    lambda_sample = lognormal_dist.sample()
+
+    poisson_dist = torch.distributions.Poisson(lambda_sample)
+    return poisson_dist.sample().item()
+
+class AdaptiveFusion(nn.Module):
+    def __init__(self, input_size_1=768, input_size_2=768, output_siz=2, bias=False):
+        super(AdaptiveFusion, self).__init__()
+        self.sigmoid = nn.Sigmoid()
+        self.weight_input_1 = nn.Linear(input_size_1, output_siz, bias=bias)
+        self.weight_input_2 = nn.Linear(input_size_2, output_siz, bias=bias)
+        self.layer_norm = nn.LayerNorm(input_size_1, eps=1e-5)
+
+    def forward(self, input_1, input_2):
+        fm_sigmoid = self.sigmoid(self.weight_input_1(input_1) + self.weight_input_2(input_2))
+        lambda1 = fm_sigmoid.clone().detach()[:, :, 0].unsqueeze(-1)
+        lambda2 = fm_sigmoid.clone().detach()[:, :, 1].unsqueeze(-1)
+
+        fused_output = input_1 + input_2 + torch.mul(lambda1, input_1) + torch.mul(lambda2, input_2)
+        fused_output = self.layer_norm(fused_output)
+        return fused_output
+
+class BiLSTMLayer(nn.Module):
+    def __init__(self, input_size=768, hidden_size=768, num_layers=2, dropout=0.3,
+                 bidirectional=True, rnn_type='LSTM'):
+        super(BiLSTMLayer, self).__init__()
+
+        self.dropout = dropout
+        self.num_layers = num_layers
+        self.input_size = input_size
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+        self.hidden_size = int(hidden_size / self.num_directions)
+        self.rnn_type = rnn_type
+        self.rnn = getattr(nn, self.rnn_type)(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            bidirectional=self.bidirectional,
+            batch_first=True
+        )
+        self.layer_norm = nn.LayerNorm(input_size, eps=1e-5)
+
+    def forward(self, src_feats, src_lens, max_len):
+        packed_emb = nn.utils.rnn.pack_padded_sequence(src_feats, src_lens.cpu(), batch_first=True, enforce_sorted=False)
+        packed_outputs, _ = self.rnn(packed_emb)
+        rnn_outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True, total_length=max_len)
+        rnn_outputs = self.layer_norm(rnn_outputs)
+        return rnn_outputs
+
+def save_pca_projected_embeddings(args,hyp_body, hyp_left, hyp_right, hyp_face, save_path="pca_projected_embeddings.npz"):
+    """
+    Applies PCA to Poincaré embeddings and saves the 2D projected data.
+    """
+    def pca_project(tensor):
+        x = tensor.detach().cpu().float().numpy()
+        pca = PCA(n_components=2)
+        return pca.fit_transform(x)
+
+    body_proj  = pca_project(hyp_body)
+    left_proj  = pca_project(hyp_left)
+    right_proj = pca_project(hyp_right)
+    face_proj  = pca_project(hyp_face)
+
+    labels = (["body"] * len(body_proj) +
+              ["left"] * len(left_proj) +
+              ["right"] * len(right_proj) +
+              ["face"] * len(face_proj))
+
+    all_data = np.concatenate([body_proj, left_proj, right_proj, face_proj], axis=0)
+    labels   = np.array(labels)
+    save_path = f"/home/mupu0001/LoopSLU2025/vis/{args.dataset.lower()}/pca_projected_embeddings_{args.dataset}_{args.count}.npz"
+    # Save as .npz for later loading
+    np.savez(save_path, x=all_data[:, 0], y=all_data[:, 1], labels=labels)
+
+    args.count += 1
+    # Optionally: print the shape for debug
+    print(f"Saved PCA projected data to {save_path} with shape {all_data.shape}")
+
+def save_poincare_logmap_pca_S(args, hyp_body, hyp_left, hyp_right, hyp_face, manifold, save_path="pca_logmap_projected_embeddings.npz"):
+
+    def logmap_and_project(tensor):
+        logmap = manifold.logmap0(tensor.float())  # -> Euclidean
+        x_np = logmap.detach().cpu().numpy()
+        return PCA(n_components=2).fit_transform(x_np)
+
+    body_proj  = logmap_and_project(hyp_body)
+    left_proj  = logmap_and_project(hyp_left)
+    right_proj = logmap_and_project(hyp_right)
+    face_proj  = logmap_and_project(hyp_face)
+
+    labels = (["body"] * len(body_proj) +
+              ["left"] * len(left_proj) +
+              ["right"] * len(right_proj) +
+              ["face"] * len(face_proj))
+
+    all_data = np.concatenate([body_proj, left_proj, right_proj, face_proj], axis=0)
+    labels   = np.array(labels)
+
+    # Optional: Normalize to unit disk
+    radii = np.sqrt(np.sum(all_data**2, axis=1))
+    max_radius = np.max(radii)
+    if max_radius >= 1.0:
+        print(f"[Warning] Max radius before normalization: {max_radius:.4f}, normalizing to fit inside unit disk.")
+        all_data = all_data / (max_radius + 1e-6)
+
+    # Print diagnostics
+    # print(f"Projected radius range: min={radii.min():.4f}, max={radii.max():.4f}, mean={radii.mean():.4f}")
+
+    # Construct path
+    save_path = f"/home/mupu0001/LoopSLU2025/vis/{args.dataset.lower()}/pca_projected_embeddings_{args.dataset}_{args.count}.npz"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Save
+    np.savez(save_path, x=all_data[:, 0], y=all_data[:, 1], labels=labels)
+    # print(f"[✓] Saved PCA projected data to {save_path} with shape {all_data.shape}")
+
+    args.count += 1
+
+
+def save_poincare_logmap_pca_SandT(args, pose_mu_mfd, hyp_text, manifold, save_path="pca_logmap_projected_embeddings.npz"):
+
+    def logmap_and_project(tensor):
+        logmap = manifold.logmap0(tensor.float())  # -> Euclidean
+        x_np = logmap.detach().cpu().numpy()
+        return PCA(n_components=2).fit_transform(x_np)
+
+    pose_proj  = logmap_and_project(pose_mu_mfd)
+    text_proj  = logmap_and_project(hyp_text)
+
+    labels = (["pose"] * len(pose_proj) +
+              ["text"] * len(text_proj))
+
+    all_data = np.concatenate([pose_proj, text_proj], axis=0)
+    labels   = np.array(labels)
+
+    # Optional: Normalize to unit disk
+    radii = np.sqrt(np.sum(all_data**2, axis=1))
+    max_radius = np.max(radii)
+    if max_radius >= 1.0:
+        print(f"[Warning] Max radius before normalization: {max_radius:.4f}, normalizing to fit inside unit disk.")
+        all_data = all_data / (max_radius + 1e-6)
+
+    # Print diagnostics
+    print(f"Projected radius range: min={radii.min():.4f}, max={radii.max():.4f}, mean={radii.mean():.4f}")
+
+    # Construct path
+    save_path = f"/home/mupu0001/LoopSLU2025/vis/{args.dataset.lower()}/pose_text_feats/pca_projected_embeddings_{args.dataset}_{args.count}.npz"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Save
+    np.savez(save_path, x=all_data[:, 0], y=all_data[:, 1], labels=labels)
+    print(f"[✓] Saved PCA projected data to {save_path} with shape {all_data.shape}")
+
+    args.count += 1
+
+def is_main_process():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+
+
+# ============================================================================ #
+# Adapted from the hyperbolic contrastive regularisation of Geo-Sign
+# ============================================================================ #
+
+class HyperbolicMapper(nn.Module):
+    def __init__(self, in_dim, out_dim, hyp):
+        super().__init__()
+        self.linear      = nn.Linear(in_dim, out_dim, bias=True)
+        self.scale_param = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.hyp = hyp
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # cast to weight dtype for mixed precision compatibility
+        x_cast   = x.to(self.linear.weight.dtype)
+        # scale tangent vector before lifting onto manifold
+        tangent  = self.linear(x_cast) * self.scale_param.exp()
+        # lift to hyp all via exponential map at origin
+        return self.hyp.expmap0(tangent.float(), project=True)
+
+
+class HyperbolicAlignmentLoss(nn.Module):
+    def __init__(self, label_smoothing, hyp):
+        super().__init__()
+        self.hyp = hyp 
+        self.log_tau   = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.margin    = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=label_smoothing,
+            ignore_index=-100,
+        )
+
+    def _empty_output(self, device: torch.device) -> Dict:
+        return {
+            "loss":     torch.tensor(0.0, device=device, requires_grad=True),
+            "pos_dist": torch.tensor(0.0, device=device),
+            "tau":      torch.tensor(0.0, device=device),
+            "margin":   self.margin.detach(),
+        }
+
+    def forward(self, sign_emb: torch.Tensor,
+                text_emb: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            sign_emb: (B, d) hyperbolic sign embeddings
+            text_emb: (B, d) hyperbolic text embeddings
+        """
+        B = sign_emb.shape[0]
+        if B == 0:
+            return self._empty_output(sign_emb.device)
+
+        # pairwise geodesic distances in hyperbolic space: (B, B)
+        geo_dist = self.hyp.dist(
+            sign_emb.unsqueeze(1).expand(-1, B, -1),
+            text_emb.unsqueeze(0).expand(B, -1, -1),
+            keepdim=False,
+        )
+
+        # similarity = negative geodesic distance scaled by temperature
+        tau     = torch.sigmoid(self.log_tau) * 1.99 + 0.01
+        scores  = -geo_dist / tau
+
+        # apply margin to all off-diagonal (negative) pairs
+        is_negative = ~torch.eye(B, device=scores.device, dtype=torch.bool)
+        scores      = scores + self.margin.clamp(min=0.0) * is_negative.float()
+
+        # contrastive loss with diagonal as positive pairs
+        labels = torch.arange(B, device=sign_emb.device)
+        loss   = self.criterion(scores, labels)
+
+        return {
+            "loss":     loss,
+            "pos_dist": geo_dist.diagonal().mean().detach(),
+            "tau":      tau.detach(),
+            "margin":   self.margin.detach(),
+        }
+
+
+def compute_frechet_mean(
+    part_embeddings: torch.Tensor,   # (N, B, d) hyperbolic part embeddings
+    part_weights:    torch.Tensor,   # (N, B)    positive attention weights
+    hyp,
+    max_iter:        int   = 50,
+    tol:             float = 1e-5, 
+) -> torch.Tensor:                   # (B, d)
+    """
+    Args:
+        part_embeddings: hyperbolic embeddings for each body part
+        part_weights:    normalised weights per part per sample
+        max_iter:        maximum Riemannian gradient steps
+        tol:             convergence threshold on geodesic displacement
+    """
+    # normalise weights across parts dimension
+    w   = part_weights / (part_weights.sum(dim=0, keepdim=True) + 1e-8)  # (N, B)
+    # initialise mean at first part embedding
+    mu  = part_embeddings[0].clone()   # (B, d)
+
+    for _ in range(max_iter):
+        # map all part embeddings to tangent space at current mean
+        log_vecs  = hyp.logmap(
+            mu.unsqueeze(0),      # (1, B, d)
+            part_embeddings,      # (N, B, d)
+        )                         # (N, B, d)
+
+        # weighted sum of tangent vectors -> gradient direction
+        grad_step = (w.unsqueeze(-1) * log_vecs).sum(dim=0)   # (B, d)
+
+        # retract onto manifold via exponential map
+        mu_next   = hyp.expmap(mu, grad_step, project=True)
+
+        # check convergence via geodesic displacement
+        delta     = hyp.dist(mu_next, mu, keepdim=False)
+        if (delta < tol).all():
+            break
+        mu = mu_next
+
+    return mu

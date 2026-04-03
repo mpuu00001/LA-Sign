@@ -203,7 +203,7 @@ class Uni_Sign(nn.Module):
         assert start == rgb_feat.shape[0]
         return gcn_feat
 
-    def forward(self, src_input, tgt_input):
+    def forward(self, src_input, tgt_input, call_from_kid=False):
         # RGB branch forward
         if self.args.rgb_support:
             rgb_support_dict = {}
@@ -264,13 +264,13 @@ class Uni_Sign(nn.Module):
         # concat sub-pose feature across token dimension
         inputs_embeds = torch.cat(features, dim=-1) + self.part_para
         inputs_embeds = self.pose_proj(inputs_embeds)
-        #TODO: save the inputs_embeds 
+
         prefix_token = self.mt5_tokenizer(
                                 [f"Translate sign language video to {self.lang}: "] * len(tgt_input["gt_sentence"]),
                                 padding="longest",
-                                truncation=True,
+                                # truncation=True,
                                 return_tensors="pt",
-                            ).to(inputs_embeds.device)
+                            ).to(self.args.device)
         
         prefix_embeds = self.mt5_model.encoder.embed_tokens(prefix_token['input_ids'])
         inputs_embeds = torch.cat([prefix_embeds, inputs_embeds], dim=1)
@@ -286,28 +286,39 @@ class Uni_Sign(nn.Module):
             
         labels = tgt_input_tokenizer['input_ids']
         labels[labels == self.mt5_tokenizer.pad_token_id] = -100
-        
+
+        stack_out = {}
+        if self.args.save_embeddings:
+            stack_out = self.save_vital_embedding(inputs_embeds, labels, tgt_input, src_input)
+
         out = self.mt5_model(inputs_embeds = inputs_embeds,
                     attention_mask = attention_mask,
                     labels = labels.to(inputs_embeds.device),
                     return_dict = True,
+                    output_hidden_states=call_from_kid
                     )
         
+        if call_from_kid:
+            base_out = {
+                'inputs_embeds': inputs_embeds,
+                'attention_mask': attention_mask,
+                'prompt_embeds': prefix_embeds,
+                'labels': labels,
+                'last_decoder_hidden_states': out.decoder_hidden_states[-1]
+            }
+            return base_out
         label = labels.reshape(-1)
         out_logits = out['logits']
         logits = out_logits.reshape(-1,out_logits.shape[-1])
         loss_fct = torch.nn.CrossEntropyLoss(label_smoothing=self.args.label_smoothing, ignore_index=-100)
         loss = loss_fct(logits, label.to(out_logits.device, non_blocking=True))
 
-        stack_out = {
-            # use for inference
-            'inputs_embeds':inputs_embeds,
-            'attention_mask':attention_mask,
-            'loss':loss,
-        }
+        stack_out['inputs_embeds'] = inputs_embeds
+        stack_out['attention_mask'] = attention_mask
+        stack_out['loss'] = loss
 
         return stack_out
-    
+
     @torch.no_grad()
     def generate(self,pre_compute_item,max_new_tokens,num_beams):
         inputs_embeds = pre_compute_item['inputs_embeds']
@@ -320,6 +331,26 @@ class Uni_Sign(nn.Module):
                             )
 
         return out
+
+    def get_txt_embeddings(self, labels):
+        txt_input_ids = self.mt5_model.decoder._shift_right(labels)
+        txt_input_shape = txt_input_ids.size()
+        txt_input_ids = txt_input_ids.view(-1, txt_input_shape[-1]).to(self.args.device)
+        txt_input_embeds = self.mt5_model.decoder.embed_tokens(txt_input_ids)
+        return txt_input_embeds
+
+    def save_vital_embedding(self, inputs_embeds, labels, tgt_input, src_input):
+        stack_out = {}
+        vis_inputs_embeds = inputs_embeds
+        txt_input_embeds = self.get_txt_embeddings(labels)
+        stack_out['label_key'] = tgt_input['label_key']
+        stack_out['names'] = src_input['name_batch']
+        stack_out['glosses'] = tgt_input['gt_gloss']
+        stack_out['sentences'] = tgt_input['gt_sentence']
+        stack_out['labels'] = labels
+        stack_out['txt_input_embeds'] = txt_input_embeds
+        stack_out['vis_inputs_embeds'] = vis_inputs_embeds
+        return stack_out
 
 def get_requires_grad_dict(model):
     param_requires_grad = {name: True for name, param in model.named_parameters()}

@@ -269,11 +269,32 @@ def sableu(references, hypotheses, tokenizer):
 
 def translation_performance(txt_ref, txt_hyp):
     from rouge import Rouge as SLT_Rouge
+    from rouge_score import rouge_scorer
 
-    rouge=SLT_Rouge()
-    scores = rouge.get_scores(txt_hyp, txt_ref, avg=True)
-    scores['rouge-l']['f'] = scores['rouge-l']['f']*100
-    
+    filtered_ref, filtered_hyp = [], []
+    for r, h in zip(txt_ref, txt_hyp):
+        if h.strip():  
+            filtered_ref.append(r)
+            filtered_hyp.append(h)
+    if not filtered_hyp:
+        print("All hypotheses are empty! Skipping ROUGE computation.")
+        return {'bleu1': 0.0, 'bleu2': 0.0, 'bleu3': 0.0, 'bleu4': 0.0}, 0.0
+
+    try:
+        rouge=SLT_Rouge()
+        scores = rouge.get_scores(txt_hyp, txt_ref, avg=True)
+        scores['rouge-l']['f'] = scores['rouge-l']['f']*100
+
+    except (RecursionError, ValueError) as e:
+        print(f"Fallback to rouge-score due to: {e}")
+        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+        rouge_l_scores = []
+        for ref, hyp in zip(filtered_ref, filtered_hyp):
+            score = scorer.score(ref, hyp)
+            rouge_l_scores.append(score['rougeL'].fmeasure * 100)
+        rouge_l_avg = sum(rouge_l_scores) / len(rouge_l_scores)
+        scores = {'rouge-l': {'f': rouge_l_avg}}
+
     tokenizer_args = '13a'
     # print('Signature: BLEU+case.mixed+numrefs.1+smooth.exp+tok.%s+version.1.4.2' % tokenizer_args)
     sableu_dict = sableu(references=txt_ref, hypotheses=txt_hyp, tokenizer=tokenizer_args)
@@ -282,7 +303,7 @@ def translation_performance(txt_ref, txt_hyp):
     # print('Chrf', chrf(references=txt_ref, hypotheses=txt_hyp))
    
     print(sableu_dict)
-    print(f"Rough: {scores['rouge-l']['f']:.2f}")
+    print(f"Rough-L: {scores['rouge-l']['f']:.2f}")
    
     # res = []
     # for n in range(4):
